@@ -1,0 +1,117 @@
+#!/bin/sh
+
+: ${GPG:=gpg}
+: ${VAULT_PASSWORD_FILE:=.vault-password.gpg}
+
+export GPG
+export VAULT_PASSWORD_FILE
+export PAGER=cat
+
+trap 'rm -f $TMPFILES' EXIT
+
+die () {
+	echo "ERROR: $*" >&2
+	exit 1
+}
+
+usage () {
+	echo "${0##*/}: usage: ${0##*/} ( help | init | encrypt | decrypt | cat <file> )"
+}
+
+do_encrypt () {
+	tmpfile=$(mktemp cryptXXXXXX)
+	trap 'rm -f $tmpfile' EXIT
+
+	cat > $tmpfile
+
+	ansible-vault encrypt --vault-password-file=${0%/*}/gpgvault-get-password $tmpfile || exit 1
+
+	cat $tmpfile
+	rm $tmpfile
+}
+
+decrypt_and_view () {
+	errfile=$(mktemp errXXXXXX)
+	TMPFILES="$errfile $TMPFILES"
+
+	if ! ansible-vault view --vault-password-file=${0%/*}/gpgvault-get-password "$1" 2> $errfile; then
+		if grep -q 'is not encrypted' $errfile; then
+			cat "$1"
+		else
+			cat $errfile
+			exit 1
+		fi
+	fi
+}
+
+do_decrypt () {
+	tmpfile=$(mktemp cryptXXXXXX)
+	TMPFILES="$tmpfile $TMPFILES"
+
+	cat > $tmpfile
+	decrypt_and_view $tmpfile
+}
+
+do_cat () {
+	decrypt_and_view "$1"
+}
+
+do_init() {
+	cd $TOPDIR
+
+	git config filter.vault.clean "$0 encrypt"
+	git config filter.vault.smudge "$0 decrypt"
+	git config diff.vault.textconv "$0 cat"
+
+	if ! grep -q '^\*.vault' .gitattributes; then
+	cat >> .gitattributes <<-EOF
+	*.vault filter=vault diff=vault
+	EOF
+	fi
+
+	if [ ! -f ${VAULT_PASSWORD_FILE} ]; then
+		if tty > /dev/null; then
+			while :; do
+				echo "Enter a vault password: "
+				read password1
+				echo "Enter a vault password (confirm): "
+				read password2
+
+				[ "$password1" = "$password2" ] && break
+				echo "Passwords do not match."
+			done
+			echo "$password1" | gpg -e -o ${VAULT_PASSWORD_FILE}
+		else
+			gpg -e -o ${VAULT_PASSWORD_FILE}
+		fi
+	else
+		echo "Found existing $VAULT_PASSWORD_FILE"
+	fi
+
+	echo "Initialized gpgvault in $TOPDIR"
+}
+
+cmd=$1
+shift
+
+git rev-parse || die "gpgvault needs to be run inside a git repository"
+TOPDIR=$(git rev-parse --show-toplevel)
+
+case "$cmd" in
+	(init)
+		do_init;;
+	(encrypt)
+		do_encrypt;;
+	(decrypt)
+		do_decrypt;;
+	(cat)	do_cat "$@";;
+
+	(help)	usage
+		exit 0
+		;;
+
+	(*)	usage >&2
+		exit 2
+		;;
+esac
+
