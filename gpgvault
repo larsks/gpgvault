@@ -1,9 +1,11 @@
-#!/bin/sh
+#!/bin/bash
 
 : ${GPG:=gpg}
+: ${OPENSSL:=openssl}
 : ${VAULT_PASSWORD_FILE:=.vault-password.gpg}
 
 export GPG
+export OPENSSL
 export VAULT_PASSWORD_FILE
 export PAGER=cat
 
@@ -56,35 +58,71 @@ do_cat () {
 	decrypt_and_view "$1"
 }
 
+read_vault_password () {
+	local _rc=0
+
+	if [ "$_generate" = 1 ]; then
+		if ! ${OPENSSL} rand -hex $_keysize; then
+			_rc=1
+		else
+			echo "generated $_keysize bit key in $VAULT_PASSWORD_FILE" >&2
+		fi
+	elif tty > /dev/null; then
+		while :; do
+			echo "Enter a vault password: " > /dev/tty
+			read password1 < /dev/tty
+			echo "Enter a vault password (confirm): " > /dev/tty
+			read password2 < /dev/tty
+
+			[ "$password1" = "$password2" ] && break
+			echo "Passwords do not match." > /dev/tty
+		done
+		echo "$password1"
+	else
+		cat
+	fi
+
+	return $_rc
+}
+
 do_init() {
+	local _generate=0
+	local _force=0
+	local _keysize=512
+
+	while getopts 'gk:f' ch; do
+		case $ch in
+		(g) _generate=1;;
+		(k) _keysize=$OPTARG;;
+		(f) _force=1;;
+		esac
+	done
+	shift $(( OPTIND - 1 ))
+
 	cd $TOPDIR
 
-	if [ ! -f ${VAULT_PASSWORD_FILE} ]; then
-		if tty > /dev/null; then
-			while :; do
-				echo "Enter a vault password: "
-				read password1
-				echo "Enter a vault password (confirm): "
-				read password2
-
-				[ "$password1" = "$password2" ] && break
-				echo "Passwords do not match."
-			done
-			echo "$password1" | gpg -e -o ${VAULT_PASSWORD_FILE}
-		else
-			gpg -e -o ${VAULT_PASSWORD_FILE}
-		fi
+	if [ ! -f ${VAULT_PASSWORD_FILE} ] || [ "$_force" = 1 ]; then
+		read_vault_password $tmpfile | ${GPG} -e -o ${VAULT_PASSWORD_FILE} --batch --yes
 	else
 		echo "Found existing $VAULT_PASSWORD_FILE"
 	fi
 
-	ansible localhost -m ini_file \
+	errfile=$(mktemp errXXXXXX)
+	TMPFILES="$errfile $TMPFILES"
+
+	if ! ansible localhost -m ini_file \
 		-a "dest=ansible.cfg
 		    section=defaults
 		    option=vault_password_file
-		    value='${0%/*}/gpgvault-get-password'"
+		    value='${0%/*}/gpgvault-get-password'" > $errfile 2>&1; then
 
-	if ! grep -q '^\*.vault' .gitattributes; then
+		cat $errfile >&2
+		die "failed to configure vault password in ansible.cfg"
+
+	fi
+
+
+	if ! grep -q '^\*.vault' .gitattributes 2> /dev/null; then
 		echo "*.vault diff=vault" >> .gitattributes
 	fi
 	git config diff.vault.textconv "$0 cat"
@@ -100,12 +138,16 @@ TOPDIR=$(git rev-parse --show-toplevel)
 
 case "$cmd" in
 	(init)
-		do_init;;
+		do_init "$@";;
+
 	(encrypt)
-		do_encrypt;;
+		do_encrypt "$@";;
+
 	(decrypt)
-		do_decrypt;;
-	(cat)	do_cat "$@";;
+		do_decrypt "$@";;
+
+	(cat)
+		do_cat "$@";;
 
 	(help)	usage
 		exit 0
@@ -114,5 +156,5 @@ case "$cmd" in
 	(*)	usage >&2
 		exit 2
 		;;
-esac
 
+esac
